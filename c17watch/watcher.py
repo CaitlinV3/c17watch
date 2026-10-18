@@ -12,6 +12,7 @@ import requests
 
 from .config import Config
 from .geo import bearing_deg, closest_approach_miles, compass_point, haversine_miles
+from .health import Health, fmt_duration
 from .notify import Message, Notifier
 from .providers import Aircraft, AuthError, Provider, ProviderError, RateLimited, user_agent
 from .ratelimit import BudgetExhausted, RateLimiter
@@ -121,7 +122,8 @@ class Watcher:
         self.session = session
         self.session.headers["User-Agent"] = user_agent(cfg.contact)
         self.state = StateStore(cfg.state_path)
-        self.limiter = RateLimiter(provider, cfg.poll_interval_s, self.state.usage)
+        self.limiter = RateLimiter(provider, cfg.poll_interval_s, self.state.usage, cfg.max_backoff_s)
+        self.health = Health(self.state.data.setdefault("health", {}), time.time())
         self._stop = threading.Event()
 
     def stop(self, *_args) -> None:
@@ -149,26 +151,32 @@ class Watcher:
         except RateLimited as e:
             delay = self.limiter.record_failure(e.retry_after)
             log.warning("%s rate limited us; backing off %.0fs", self.provider.name, delay)
-            self.state.save()
+            self._after_poll(time.time(), error="rate limited (HTTP 429)")
             return 0
-        except AuthError:
-            self.state.save()
+        except AuthError as e:
+            self._after_poll(time.time(), error=str(e))
             raise
         except ProviderError as e:
             delay = self.limiter.record_failure()
             log.warning("%s; retrying in %.0fs", e, delay)
-            self.state.save()
+            self._after_poll(time.time(), error=str(e))
             return 0
 
-        self.limiter.record_success(headers)
         now = time.time()
+        self.limiter.record_success(headers)
+        recovered = self.health.record_success(now, used_failover=self.provider.last_failed_addresses > 0)
+        if recovered:
+            log.info("%s reachable again after %d failed polls (outage %s)",
+                     self.provider.name, recovered[0], fmt_duration(recovered[1]))
         sightings = evaluate(self.cfg, aircraft, self.state.aircraft, now, self.limiter.interval_s)
         log.debug("%d aircraft returned, %d alerts", len(aircraft), len(sightings))
 
         if sightings:
             msg = format_message(sightings, self.provider)
             log.info("ALERT: %s", msg.body.replace("\n", " | "))
-            if not self.notifier.send_with_retry(msg):
+            if self.notifier.send_with_retry(msg):
+                self.health.record_alerts(len(sightings))
+            else:
                 # Let it fire again next poll rather than silently swallowing it.
                 for s in sightings:
                     st = self.state.aircraft[s.aircraft.hex]
@@ -176,8 +184,23 @@ class Watcher:
                     st["inside"] = False
 
         self.state.prune(now)
-        self.state.save()
+        self._after_poll(now)
         return len(sightings)
+
+    def _after_poll(self, now: float, error: str | None = None) -> None:
+        """Health bookkeeping, hourly status line, heartbeat, then persist."""
+        if error:
+            self.health.record_failure(now, error)
+        if self.health.hourly_due(now):
+            log.info("%s", self.health.hourly_line(now))
+        if self.health.heartbeat_due(now, self.cfg.heartbeat_s):
+            msg = self.health.heartbeat_message(now, self.cfg.heartbeat_s)
+            if self.notifier.send_with_retry(msg):
+                log.info("heartbeat sent: %s", msg.body.replace("\n", " | "))
+                self.health.heartbeat_sent(now)
+            else:
+                self.health.heartbeat_failed(now, self.cfg.heartbeat_s)
+        self.state.save()
 
     def run(self) -> None:
         log.info(
@@ -191,6 +214,8 @@ class Watcher:
                 log.warning("%s", e)
                 self._stop.wait(min(e.wait_s, 3600))
             except AuthError as e:
-                log.error("%s; exiting", e)
-                return
+                # Don't exit: under Docker's restart policy that becomes a tight
+                # restart loop hammering the API. Wait, then try again.
+                log.error("%s; retrying in 1h", e)
+                self._stop.wait(3600)
         self.state.save()

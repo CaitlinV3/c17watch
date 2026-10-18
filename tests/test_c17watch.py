@@ -19,8 +19,8 @@ def cfg(**kw):
     base = dict(
         lat=HOME[0], lon=HOME[1], radius_miles=15, cooldown_s=1800, lookahead=True,
         ignore_on_ground=True, max_position_age_s=60, aircraft_type="C17",
-        respect_privacy_flags=True, provider="adsblol", poll_interval_s=60, contact=None,
-        notify={}, state_path=Path(tempfile.mkdtemp()) / "s.json",
+        respect_privacy_flags=True, provider="adsblol", poll_interval_s=60, max_backoff_s=300,
+        contact=None, notify={}, heartbeat_s=0, state_path=Path(tempfile.mkdtemp()) / "s.json",
     )
     base.update(kw)
     return Config(**base)
@@ -141,14 +141,18 @@ class RateLimitTests(unittest.TestCase):
 
     def test_retry_after_and_backoff(self):
         t = [0.0]
-        rl = RateLimiter(self.provider(), 60, {}, clock=lambda: t[0])
-        self.assertEqual(rl.record_failure(retry_after=300), 300)
+        rl = RateLimiter(self.provider(), 10, {}, clock=lambda: t[0])
+        self.assertEqual(rl.record_failure(retry_after=900), 900)  # server's request beats the cap
         d1 = rl.record_failure()
         d2 = rl.record_failure()
-        self.assertGreater(d2, d1 * 1.2)
+        self.assertGreater(d2, d1 * 1.2)  # exponential growth
         for _ in range(20):
-            rl.record_failure()
-        self.assertLessEqual(rl.record_failure(), 15 * 60 * 1.2)
+            self.assertLessEqual(rl.record_failure(), 300)  # hard 5-minute ceiling, even with jitter
+
+    def test_backoff_cap_configurable(self):
+        rl = RateLimiter(self.provider(), 60, {}, max_backoff_s=120)
+        for _ in range(10):
+            self.assertLessEqual(rl.record_failure(), 120)
 
     def test_rapidapi_quota_header(self):
         usage = {}
@@ -306,6 +310,146 @@ class FailoverTests(unittest.TestCase):
         with mock.patch("socket.getaddrinfo", return_value=self.ADDRS), self.assertRaises(ProviderError):
             build_provider("adsblol").fetch(s, "C17")
         self.assertEqual(len(calls), 2)
+
+
+
+class HealthTests(unittest.TestCase):
+    def test_outage_tracking_and_recovery(self):
+        from c17watch.health import Health
+        h = Health({}, now=0)
+        h.record_success(10)
+        h.record_failure(70, "boom")
+        h.record_failure(200, "boom")
+        self.assertEqual(h.current_outage(300), 230)
+        self.assertEqual(h.record_success(400, used_failover=True), (2, 330))
+        self.assertEqual(h.current_outage(500), 0)
+        self.assertEqual(h.d["period"]["longest_outage_s"], 330)
+        self.assertEqual((h.d["period"]["ok"], h.d["period"]["failed"], h.d["period"]["failovers"]), (2, 2, 1))
+
+    def test_hourly_line_resets_window(self):
+        from c17watch.health import Health
+        h = Health({}, now=0)
+        for t in range(60, 3600, 60):
+            h.record_success(t)
+        h.record_failure(3590, "x")
+        self.assertFalse(h.hourly_due(3500))
+        self.assertTrue(h.hourly_due(3600))
+        line = h.hourly_line(3600)
+        self.assertIn("59 ok", line)
+        self.assertIn("1 failed", line)
+        self.assertEqual(h.d["hour"]["ok"], 0)  # reset
+        self.assertEqual(h.d["period"]["ok"], 59)  # heartbeat window untouched
+
+    def test_heartbeat_schedule_and_title(self):
+        from c17watch.health import Health
+        h = Health({}, now=0)
+        self.assertTrue(h.heartbeat_due(0, 86400))  # first one goes out right away
+        self.assertFalse(h.heartbeat_due(0, 0))  # 0 = disabled
+        h.record_success(60)
+        msg = h.heartbeat_message(60, 86400)
+        self.assertEqual((msg.title, msg.priority), ("c17watch started", "low"))
+        self.assertIn("Next status update in 1d 0h", msg.body)
+        h.heartbeat_sent(60)
+        h.record_success(120)
+        msg = h.heartbeat_message(120)
+        self.assertEqual(msg.title, "c17watch running")
+        self.assertIn("1 poll OK", msg.body)
+        self.assertFalse(h.heartbeat_due(3600, 86400))
+        h.record_failure(80000, "adsb.lol: HTTP 503")
+        msg = h.heartbeat_message(86460)
+        self.assertEqual(msg.title, "c17watch: data feed down")
+        self.assertIn("HTTP 503", msg.body)
+        h.heartbeat_failed(86460, 86400)
+        self.assertFalse(h.heartbeat_due(86460 + 1800, 86400))
+        self.assertTrue(h.heartbeat_due(86460 + 3600, 86400))  # retried an hour later
+
+    def test_watcher_sends_one_heartbeat_and_counts_failures(self):
+        c = cfg(heartbeat_s=86400)
+        session = mock.Mock()
+        session.headers = {}
+        session.get.return_value = FakeResponse(503)
+        notifier = mock.Mock()
+        notifier.send_with_retry.return_value = True
+        w = Watcher(c, build_provider("adsblol"), notifier, session)
+        with mock.patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("1.2.3.4", 443))]):
+            w.poll_once()
+            w.limiter.next_allowed = 0
+            w.poll_once()
+        self.assertEqual(notifier.send_with_retry.call_count, 1)
+        saved = json.loads(c.state_path.read_text())["health"]
+        self.assertEqual((saved["period"]["failed"], saved["fail_streak"]), (1, 2))  # 1st failure reported then reset; streak keeps both
+        self.assertIn("provider's side", saved["last_error"])
+
+
+class AddressHandlingTests(unittest.TestCase):
+    ADDRS = [(10, 1, 6, "", ("2a03:4000:5f:82::", 443, 0, 0)), (2, 1, 6, "", ("89.58.11.153", 443)),
+             (10, 1, 6, "", ("2a03:4000:64:87::", 443, 0, 0)), (2, 1, 6, "", ("185.233.105.52", 443))]
+
+    def run_fetch(self, outcomes, ipv6):
+        import requests
+        s = requests.Session()
+        calls = []
+        def get(url, **kw):
+            calls.append(url.split("/")[2])
+            o = outcomes.pop(0)
+            if isinstance(o, Exception):
+                raise o
+            return o
+        s.get = get
+        p = build_provider("adsblol")
+        with mock.patch("socket.getaddrinfo", return_value=self.ADDRS), \
+             mock.patch("c17watch.providers.has_ipv6_route", return_value=ipv6):
+            try:
+                p.fetch(s, "C17")
+                err = None
+            except Exception as e:  # noqa: BLE001
+                err = e
+        return calls, err, p
+
+    def test_ipv6_skipped_without_route(self):
+        import requests
+        calls, err, _ = self.run_fetch([requests.ConnectionError(), requests.ConnectionError()], ipv6=False)
+        self.assertEqual(calls, ["89.58.11.153", "185.233.105.52"])
+        self.assertIn("all 2 addresses failed (89.58.11.153 ConnectionError, 185.233.105.52 ConnectionError)",
+                      str(err))
+
+    def test_ipv6_kept_with_route(self):
+        import requests
+        calls, err, _ = self.run_fetch([requests.ConnectionError()] * 4, ipv6=True)
+        self.assertEqual(len(calls), 4)
+
+    def test_failover_count_reported(self):
+        import requests
+        ok = FakeResponse(200, {"ac": []})
+        _, err, p = self.run_fetch([requests.ReadTimeout(), ok], ipv6=False)
+        self.assertIsNone(err)
+        self.assertEqual(p.last_failed_addresses, 1)
+
+    def test_per_address_logs_are_debug(self):
+        import requests
+        with self.assertLogs("c17watch.providers", level="DEBUG") as cm:
+            self.run_fetch([requests.ReadTimeout(), FakeResponse(200, {"ac": []})], ipv6=False)
+        self.assertTrue(all(r.levelname == "DEBUG" for r in cm.records))
+
+    def test_has_ipv6_route_handles_no_route(self):
+        import c17watch.providers as prov
+        prov._ipv6_cache = None
+        with mock.patch("socket.socket.connect", side_effect=OSError(101, "Network is unreachable")):
+            self.assertFalse(prov.has_ipv6_route())
+        prov._ipv6_cache = None
+
+
+class ConfigNewOptionsTests(unittest.TestCase):
+    def test_defaults_and_validation(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "a.toml").write_text("[location]\nlat=40\nlon=-75\n")
+        c = load_config(d / "a.toml")
+        self.assertEqual((c.max_backoff_s, c.heartbeat_s), (300, 86400))
+        (d / "b.toml").write_text("[location]\nlat=40\nlon=-75\n[notify]\nheartbeat_hours=0\n")
+        self.assertEqual(load_config(d / "b.toml").heartbeat_s, 0)
+        (d / "c.toml").write_text("[location]\nlat=40\nlon=-75\n[provider]\nmax_backoff_minutes=0.5\n")
+        with self.assertRaises(ConfigError):
+            load_config(d / "c.toml")
 
 
 if __name__ == "__main__":

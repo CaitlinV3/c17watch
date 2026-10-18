@@ -23,7 +23,7 @@ from .providers import Provider
 
 log = logging.getLogger(__name__)
 
-MAX_BACKOFF_S = 15 * 60
+DEFAULT_MAX_BACKOFF_S = 5 * 60
 
 
 class BudgetExhausted(Exception):
@@ -46,8 +46,16 @@ def _seconds_until_next_month(dt: datetime) -> float:
 
 
 class RateLimiter:
-    def __init__(self, provider: Provider, poll_interval_s: float, usage: dict, clock=time.time):
+    def __init__(
+        self,
+        provider: Provider,
+        poll_interval_s: float,
+        usage: dict,
+        max_backoff_s: float = DEFAULT_MAX_BACKOFF_S,
+        clock=time.time,
+    ):
         self.provider = provider
+        self.max_backoff_s = max_backoff_s
         self.clock = clock
         self.usage = usage.setdefault(provider.name, {})
         self.interval_s = self._effective_interval(poll_interval_s)
@@ -115,10 +123,11 @@ class RateLimiter:
         """Push the next request out. Returns the delay applied."""
         self.failures += 1
         if retry_after is not None:
-            delay = retry_after
+            delay = retry_after  # the server's explicit request wins over our cap
         else:
-            delay = min(MAX_BACKOFF_S, self.interval_s * (2 ** min(self.failures, 6)))
+            delay = self.interval_s * (2 ** min(self.failures, 6))
             delay *= random.uniform(0.8, 1.2)  # jitter so restarts don't sync up
+            delay = min(self.max_backoff_s, delay)  # cap after jitter so it's a hard ceiling
         delay = max(delay, self.interval_s)
         self.next_allowed = self.clock() + delay
         return delay

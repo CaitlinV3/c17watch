@@ -11,12 +11,12 @@ provider's own docs before relying on them, especially before publishing.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 import socket
+import time
 from dataclasses import dataclass, field
 from typing import Any
-
-import logging
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -40,6 +40,38 @@ class RateLimited(ProviderError):
     def __init__(self, retry_after: float | None):
         super().__init__(f"rate limited (retry after {retry_after}s)")
         self.retry_after = retry_after
+
+
+class AllAddressesFailed(requests.ConnectionError):
+    """Every IP address for the host failed. Carries what happened to each."""
+
+    def __init__(self, attempts: list[tuple[str, Exception]]):
+        self.attempts = attempts
+        detail = ", ".join(f"{ip} {type(e).__name__}" for ip, e in attempts)
+        super().__init__(f"all {len(attempts)} addresses failed ({detail})")
+
+
+_ipv6_cache: tuple[float, bool] | None = None
+
+
+def has_ipv6_route() -> bool:
+    """True if this machine has a route to the IPv6 internet.
+
+    Connecting a UDP socket sends no packets; it only asks the kernel for a
+    route, so this is free. Re-checked hourly in case the network changes.
+    """
+    global _ipv6_cache
+    now = time.monotonic()
+    if _ipv6_cache and now - _ipv6_cache[0] < 3600:
+        return _ipv6_cache[1]
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+            s.connect(("2001:4860:4860::8888", 53))
+        ok = True
+    except OSError:
+        ok = False
+    _ipv6_cache = (now, ok)
+    return ok
 
 
 class AuthError(ProviderError):
@@ -105,6 +137,7 @@ class Provider:
     timeout_s: tuple[float, float] = (5.0, 20.0)
     auth_hint: str = "access denied by the provider"
     _preferred_ip: str | None = field(default=None, repr=False)
+    last_failed_addresses: int = field(default=0, repr=False)  # set by each fetch
 
     def url(self, type_code: str) -> str:
         return self.url_template.format(type=type_code)
@@ -126,6 +159,12 @@ class Provider:
                 ai[4][0] for ai in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)))
         except socket.gaierror:
             ips = []
+        if ips and not has_ipv6_route():
+            v4 = [ip for ip in ips if ":" not in ip]
+            if v4 and len(v4) < len(ips):
+                log.debug("%s: skipping %d IPv6 addresses (no IPv6 route)", self.name, len(ips) - len(v4))
+                ips = v4
+        self.last_failed_addresses = 0
         if len(ips) < 2:  # nothing to fail over to; let requests resolve normally
             return session.get(url, headers=self.headers, timeout=self.timeout_s)
 
@@ -133,7 +172,7 @@ class Provider:
             ips.remove(self._preferred_ip)
             ips.insert(0, self._preferred_ip)
 
-        last_err: Exception | None = None
+        attempts: list[tuple[str, Exception]] = []
         for ip in ips:
             ip_netloc = f"[{ip}]" if ":" in ip else ip
             if parsed.port:
@@ -147,13 +186,18 @@ class Provider:
                 resp = session.get(pinned_url, headers={**self.headers, "Host": parsed.netloc},
                                    timeout=self.timeout_s)
             except (requests.ConnectionError, requests.Timeout) as e:
-                log.info("%s: %s failed (%s); trying next address", self.name, ip, type(e).__name__)
-                last_err = e
+                log.debug("%s: %s failed (%s); trying next address", self.name, ip, type(e).__name__)
+                attempts.append((ip, e))
                 continue
             self._preferred_ip = ip
+            self.last_failed_addresses = len(attempts)
+            if attempts:
+                log.debug("%s: reached via %s after %d failed address(es)", self.name, ip, len(attempts))
             return resp
-        assert last_err is not None
-        raise last_err
+        self.last_failed_addresses = len(attempts)
+        if all(isinstance(e, requests.exceptions.SSLError) for _, e in attempts):
+            raise attempts[-1][1]  # a certificate problem, not an outage; report it as such
+        raise AllAddressesFailed(attempts)
 
     def fetch(self, session: requests.Session, type_code: str) -> tuple[list[Aircraft], dict[str, str]]:
         """Fetch aircraft. Returns (aircraft, response headers).
@@ -162,6 +206,8 @@ class Provider:
         """
         try:
             resp = self._get_with_failover(session, self.url(type_code))
+        except AllAddressesFailed as e:
+            raise ProviderError(f"{self.name}: could not connect: {e}") from e
         except requests.exceptions.SSLError as e:
             raise ProviderError(f"{self.name}: TLS/certificate error (proxy or interception?): {e}") from e
         except (requests.ConnectionError, requests.Timeout) as e:
@@ -174,6 +220,8 @@ class Provider:
             raise RateLimited(_parse_retry_after(resp.headers.get("Retry-After")))
         if resp.status_code in (401, 403):
             raise AuthError(f"{self.name}: HTTP {resp.status_code} ({self.auth_hint})")
+        if resp.status_code >= 500:
+            raise ProviderError(f"{self.name}: HTTP {resp.status_code} (problem on the provider's side)")
         if resp.status_code >= 400:
             raise ProviderError(f"{self.name}: HTTP {resp.status_code}")
 

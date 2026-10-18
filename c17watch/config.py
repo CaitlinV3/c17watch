@@ -26,8 +26,10 @@ class Config:
     respect_privacy_flags: bool
     provider: str
     poll_interval_s: float
+    max_backoff_s: float
     contact: str | None
     notify: dict[str, Any]
+    heartbeat_s: float
     state_path: Path
 
 
@@ -75,8 +77,10 @@ def load_config(path: str | Path) -> Config:
         respect_privacy_flags=bool(privacy.get("respect_privacy_flags", True)),
         provider=str(prov.get("name", "adsblol")),
         poll_interval_s=float(prov.get("poll_interval_s", 60)),
+        max_backoff_s=float(prov.get("max_backoff_minutes", 5)) * 60,
         contact=prov.get("contact") or None,
         notify=raw.get("notify", {}),
+        heartbeat_s=float(raw.get("notify", {}).get("heartbeat_hours", 24)) * 3600,
         state_path=Path(os.environ.get("C17WATCH_STATE_PATH")
                         or raw.get("state", {}).get("path", "c17watch_state.json")),
     )
@@ -93,5 +97,9 @@ def _validate(c: Config) -> None:
         raise ConfigError("cooldown_minutes must be at least 1")
     if c.poll_interval_s < 10:
         raise ConfigError("poll_interval_s must be at least 10 (be kind to free APIs)")
+    if not 1 * 60 <= c.max_backoff_s <= 60 * 60:
+        raise ConfigError("max_backoff_minutes must be between 1 and 60")
+    if c.heartbeat_s and c.heartbeat_s < 3600:
+        raise ConfigError("heartbeat_hours must be 0 (off) or at least 1")
     if not c.aircraft_type.isalnum() or len(c.aircraft_type) > 4:
         raise ConfigError("aircraft_type must be an ICAO type designator like C17")

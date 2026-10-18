@@ -127,11 +127,11 @@ See the systemd unit under "Run" above.
 
 ## Data providers and rate limiting
 
-| `provider.name` | Key | Published terms (checked Oct 2026) | What the app enforces |
-|---|---|---|---|
-| `adsblol` (default) | none | Free; ODbL data; limits are dynamic and unpublished | ≥30 s between requests (self-imposed), backoff on 429 |
-| `airplaneslive` | none, but **must feed** | Non-commercial; 1 req/s; 500 req/day. Since ~Aug 2026 returns 403 to non-feeders | 500/day budget → polls every ~3 min |
-| `adsbexchange` | `ADSBX_RAPIDAPI_KEY` | Paid RapidAPI Community plan, non-commercial; 10,000 req/month on the $10 plan | Monthly budget → ~every 4.7 min; reads RapidAPI's remaining-quota header and slows down if it's lower than expected |
+| `provider.name`     | Key                     | Published terms (checked Oct 2026)                                               | What the app enforces                                                                                               |
+| ------------------- | ----------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `adsblol` (default) | none                    | Free; ODbL data; limits are dynamic and unpublished                              | ≥30 s between requests (self-imposed), backoff on 429                                                               |
+| `airplaneslive`     | none, but **must feed** | Non-commercial; 1 req/s; 500 req/day. Since ~Aug 2026 returns 403 to non-feeders | 500/day budget → polls every ~3 min                                                                                 |
+| `adsbexchange`      | `ADSBX_RAPIDAPI_KEY`    | Paid RapidAPI Community plan, non-commercial; 10,000 req/month on the $10 plan   | Monthly budget → ~every 4.7 min; reads RapidAPI's remaining-quota header and slows down if it's lower than expected |
 
 Rate limiting, in layers:
 
@@ -140,14 +140,32 @@ Rate limiting, in layers:
 - Daily/monthly budgets spread evenly over the period (5% headroom), persisted in the
   state file so restarts don't reset the count.
 - `429` responses honour `Retry-After`; other errors use exponential backoff with jitter,
-  capped at 15 minutes.
-- 401/403 stops the app rather than hammering a bad key.
+  capped at `max_backoff_minutes` (default 5). The cap keeps blind spots short during an
+  outage; one request every 5 minutes is still negligible load on a struggling service.
+- 401/403 pauses for an hour before retrying, instead of exiting (which under Docker's
+  restart policy would become a tight restart loop against the API).
 - Requests carry an identifying `User-Agent`; set `provider.contact` so API operators can
   reach you instead of just blocking your IP.
 
 Interval trade-off: a 3–5 minute poll can miss a C-17 that clips the edge of a small
 radius at cruise speed; lookahead covers most of that, but adsb.lol at 60 s is the most
 responsive option. Low-and-slow traffic near an airbase is easy to catch on any provider.
+
+## Health monitoring
+
+Successful polls are silent, so the app reports on itself:
+
+- **Hourly status line** in the logs:
+  `status (last 1h 0m): 52 ok, 8 failed, 3 via backup address, 0 alerts, longest outage 6m, last success 0s ago`
+- **Recovery line** when the feed comes back after failures.
+- **Heartbeat notification** (`heartbeat_hours`, default 24): a low-priority phone
+  notification with the same numbers. You get one right after starting
+  ("c17watch started"), then one per day. Its title switches to
+  "c17watch: data feed down" if polls have been failing for 10+ minutes.
+  **If a heartbeat doesn't arrive, the app or the machine is down.**
+
+The state file's `usage` counters count every request _attempt_ (they exist to respect
+rate limits); the `health` section counts successes and failures separately.
 
 ## Troubleshooting
 
@@ -158,9 +176,14 @@ responsive option. Low-and-slow traffic near an airbase is easy to catch on any 
   (Little Snitch, LuLu), corporate VPN, or a proxy. Test outside Python with
   `curl -v https://api.adsb.lol/v2/type/C17`.
 - **One provider server hangs or resets mid-connection** — handled automatically. When a
-  host has several IPs (adsb.lol has two), the app tries each in turn within the same poll,
-  with TLS still verified against the real hostname, and tries the last working IP first
-  next time. You'll see `... failed (ReadTimeout); trying next address` at INFO level.
+  host has several IPs, the app tries each in turn within the same poll, with TLS still
+  verified against the real hostname, and tries the last working IP first next time.
+  IPv6 addresses are skipped when the machine has no IPv6 route. Per-address attempts are
+  logged at DEBUG (`-v`); a poll only logs a WARNING if every address failed, e.g.
+  `could not connect: all 3 addresses failed (89.58.11.153 ReadTimeout, ...)`.
+- **`HTTP 502/503 (problem on the provider's side)`** — the provider is up but its backend
+  isn't. Nothing to fix locally; the app retries every few minutes and logs
+  `reachable again after N failed polls (outage 40m)` when it recovers.
 - **HTTP 403 from airplanes.live** — it now only serves feeders. Switch to `adsblol`.
 - **HTTP 429 from adsb.lol** — its limits are load-based; the app backs off
   automatically. Don't set `poll_interval_s` below 30.
