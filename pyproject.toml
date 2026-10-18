@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "c17watch"
+version = "0.1.0"
+description = "Phone alerts when a C-17 flies near you, from public ADS-B data"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["requests>=2.31,<3"]
+
+[project.scripts]
+c17watch = "c17watch.__main__:main"
+
+[tool.setuptools]
+packages = ["c17watch"]

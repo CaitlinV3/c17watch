@@ -1,0 +1,25 @@
+services:
+  c17watch:
+    build: .
+    image: c17watch:latest
+    container_name: c17watch
+    restart: unless-stopped          # comes back after crashes and host reboots
+    env_file: .env                   # NTFY_TOPIC etc.; keep this file out of git
+    volumes:
+      - ./config.toml:/config/config.toml:ro
+      - c17watch-data:/data          # state: cooldowns + API request budgets
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  c17watch-data:

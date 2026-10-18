@@ -1,0 +1,37 @@
+# Copy to config.toml and edit. config.toml is git-ignored because it holds
+# your location. You can also leave lat/lon out and set C17WATCH_LAT /
+# C17WATCH_LON in the environment instead.
+
+[location]
+lat = 38.8977    # decimal degrees (example: Washington, DC)
+lon = -77.0365
+
+[alert]
+radius_miles = 15          # alert when a C-17 comes within this distance
+cooldown_minutes = 30      # per aircraft: no repeat alert for the same plane inside this window
+lookahead = true           # also alert if its current course takes it inside before the next poll
+ignore_on_ground = true    # skip aircraft parked/taxiing at a nearby base
+max_position_age_s = 60    # ignore stale positions
+aircraft_type = "C17"      # ICAO type designator
+
+[provider]
+# adsblol       - free, no key, ODbL data (best fit if you publish later)
+# airplaneslive - free, no key, non-commercial, 500 requests/day on the free tier
+# adsbexchange  - paid RapidAPI Community plan, non-commercial; needs ADSBX_RAPIDAPI_KEY
+name = "adsblol"
+poll_interval_s = 60       # raised automatically if the provider's limits require it
+contact = ""               # email or repo URL sent in the User-Agent so API operators can reach you
+
+[privacy]
+# Skip aircraft enrolled in the FAA's LADD / PIA privacy programs.
+respect_privacy_flags = true
+
+[notify]
+method = "ntfy"            # ntfy | pushover | console
+ntfy_server = "https://ntfy.sh"
+# Prefer setting NTFY_TOPIC in the environment. On public ntfy.sh, anyone who
+# knows the topic can read it, so use something long and random.
+ntfy_topic = ""
+
+[state]
+path = "c17watch_state.json"

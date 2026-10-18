@@ -1,0 +1,9 @@
+config.toml
+.env
+*_state.json
+.state-*.json
+__pycache__/
+*.pyc
+.venv/
+dist/
+*.egg-info/
