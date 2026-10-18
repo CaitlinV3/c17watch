@@ -1,0 +1,3 @@
+# Top-level runtime dependencies (keep in sync with pyproject.toml).
+# Don't edit requirements.txt by hand: change this file, then run scripts/lock.sh.
+requests>=2.32.4,<3

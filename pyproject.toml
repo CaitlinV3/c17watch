@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Phone alerts when a C-17 flies near you, from public ADS-B data"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["requests>=2.31,<3"]
+dependencies = ["requests>=2.32.4,<3"]
 
 [project.scripts]
 c17watch = "c17watch.__main__:main"

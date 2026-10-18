@@ -8,7 +8,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN grep -q -- '--hash=sha256:' requirements.txt \
+ || { echo "requirements.txt is not locked: run scripts/lock.sh on your Mac and commit it" >&2; exit 1; } \
+ && pip install --require-hashes --no-deps -r requirements.txt
 
 COPY c17watch/ c17watch/
 
